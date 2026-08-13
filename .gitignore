@@ -1,0 +1,7 @@
+.pio/
+.vscode/.browse.VC.db*
+__pycache__/
+*.pyc
+jetson/.venv/
+basecamp/.venv/
+basecamp/received_images/
