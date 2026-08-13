@@ -6,15 +6,21 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import codecs
 import hashlib
+import os
 import queue
 import re
 import secrets
+import select
 import shlex
 import sys
+import termios
 import tempfile
 import threading
 import time
+import tty
+import unicodedata
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,6 +50,251 @@ class UwbNodeError(Exception):
 
 class ImageProtocolError(UwbNodeError):
     """Raised when an incoming or outgoing image packet is invalid."""
+
+
+class InteractiveConsole:
+    """Print asynchronous messages without hiding the active input prompt."""
+
+    CLEAR_CURRENT_LINE = "\r\x1b[2K"
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._input_active = False
+        self._messages: queue.SimpleQueue[str] = queue.SimpleQueue()
+        self._history: list[str] = []
+        self._wake_read, self._wake_write = os.pipe()
+        os.set_blocking(self._wake_read, False)
+        os.set_blocking(self._wake_write, False)
+
+    def close(self) -> None:
+        for descriptor in (self._wake_read, self._wake_write):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _display_width(text: str) -> int:
+        width = 0
+        for character in text:
+            if unicodedata.combining(character):
+                continue
+            width += (
+                2
+                if unicodedata.east_asian_width(character) in {"W", "F"}
+                else 1
+            )
+        return width
+
+    @staticmethod
+    def _write_message(message: str) -> None:
+        sys.stdout.write(message)
+        if not message.endswith("\n"):
+            sys.stdout.write("\n")
+
+    def _render(self, prompt: str, characters: list[str], cursor: int) -> None:
+        text = "".join(characters)
+        sys.stdout.write(f"{self.CLEAR_CURRENT_LINE}{prompt}{text}")
+        tail_width = self._display_width("".join(characters[cursor:]))
+        if tail_width:
+            sys.stdout.write(f"\x1b[{tail_width}D")
+        sys.stdout.flush()
+
+    def _notify_input_loop(self) -> None:
+        try:
+            os.write(self._wake_write, b"\0")
+        except (BlockingIOError, OSError):
+            # One pending byte is enough to wake the input loop. A full or
+            # closed pipe therefore needs no additional handling here.
+            pass
+
+    def _drain_notifications(self) -> list[str]:
+        while True:
+            try:
+                if not os.read(self._wake_read, 4096):
+                    break
+            except BlockingIOError:
+                break
+
+        messages = []
+        while True:
+            try:
+                messages.append(self._messages.get_nowait())
+            except queue.Empty:
+                return messages
+
+    def emit(self, message: str) -> None:
+        with self._lock:
+            if self._input_active:
+                self._messages.put(message)
+                self._notify_input_loop()
+                return
+
+            self._write_message(message)
+            sys.stdout.flush()
+
+    def input(self, prompt: str) -> str:
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            return input(prompt)
+
+        input_descriptor = sys.stdin.fileno()
+        original_terminal = termios.tcgetattr(input_descriptor)
+        characters: list[str] = []
+        cursor = 0
+        history_position = len(self._history)
+        history_draft = ""
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        escape_sequence = bytearray()
+        result: str | None = None
+        end_of_file = False
+
+        with self._lock:
+            self._input_active = True
+
+        try:
+            # TCSANOW preserves input already pasted or typed while the prior
+            # command was being processed. tty.setcbreak() otherwise defaults
+            # to TCSAFLUSH and silently discards that pending next command.
+            tty.setcbreak(input_descriptor, termios.TCSANOW)
+            self._render(prompt, characters, cursor)
+
+            while result is None and not end_of_file:
+                readable, _, _ = select.select(
+                    [input_descriptor, self._wake_read], [], []
+                )
+
+                if self._wake_read in readable:
+                    messages = self._drain_notifications()
+                    if messages:
+                        sys.stdout.write(self.CLEAR_CURRENT_LINE)
+                        for message in messages:
+                            self._write_message(message)
+                        self._render(prompt, characters, cursor)
+
+                if input_descriptor not in readable:
+                    continue
+
+                # Read one byte so a pasted second line remains queued for the
+                # next prompt instead of being discarded after the first Enter.
+                data = os.read(input_descriptor, 1)
+                if not data:
+                    end_of_file = True
+                    continue
+
+                for value in data:
+                    if escape_sequence:
+                        escape_sequence.append(value)
+                        sequence = bytes(escape_sequence)
+                        if sequence in {
+                            b"\x1b[A",
+                            b"\x1b[B",
+                            b"\x1b[C",
+                            b"\x1b[D",
+                            b"\x1b[H",
+                            b"\x1b[F",
+                            b"\x1b[3~",
+                        }:
+                            if sequence == b"\x1b[A" and self._history:
+                                if history_position == len(self._history):
+                                    history_draft = "".join(characters)
+                                history_position = max(0, history_position - 1)
+                                characters = list(self._history[history_position])
+                                cursor = len(characters)
+                            elif sequence == b"\x1b[B" and self._history:
+                                history_position = min(
+                                    len(self._history), history_position + 1
+                                )
+                                restored = (
+                                    history_draft
+                                    if history_position == len(self._history)
+                                    else self._history[history_position]
+                                )
+                                characters = list(restored)
+                                cursor = len(characters)
+                            elif sequence == b"\x1b[C":
+                                cursor = min(len(characters), cursor + 1)
+                            elif sequence == b"\x1b[D":
+                                cursor = max(0, cursor - 1)
+                            elif sequence == b"\x1b[H":
+                                cursor = 0
+                            elif sequence == b"\x1b[F":
+                                cursor = len(characters)
+                            elif sequence == b"\x1b[3~" and cursor < len(characters):
+                                del characters[cursor]
+                            escape_sequence.clear()
+                            self._render(prompt, characters, cursor)
+                        elif not any(
+                            candidate.startswith(sequence)
+                            for candidate in (
+                                b"\x1b[A",
+                                b"\x1b[B",
+                                b"\x1b[C",
+                                b"\x1b[D",
+                                b"\x1b[H",
+                                b"\x1b[F",
+                                b"\x1b[3~",
+                            )
+                        ):
+                            escape_sequence.clear()
+                        continue
+
+                    if value == 0x1B:
+                        escape_sequence.append(value)
+                    elif value in {0x0A, 0x0D}:
+                        result = "".join(characters)
+                        sys.stdout.write("\n")
+                        sys.stdout.flush()
+                        break
+                    elif value == 0x04:
+                        if not characters:
+                            end_of_file = True
+                            sys.stdout.write("\n")
+                            sys.stdout.flush()
+                            break
+                    elif value in {0x08, 0x7F}:
+                        if cursor > 0:
+                            cursor -= 1
+                            del characters[cursor]
+                            self._render(prompt, characters, cursor)
+                    elif value == 0x01:
+                        cursor = 0
+                        self._render(prompt, characters, cursor)
+                    elif value == 0x05:
+                        cursor = len(characters)
+                        self._render(prompt, characters, cursor)
+                    elif value == 0x0B:
+                        del characters[cursor:]
+                        self._render(prompt, characters, cursor)
+                    elif value == 0x15:
+                        del characters[:cursor]
+                        cursor = 0
+                        self._render(prompt, characters, cursor)
+                    elif value == 0x0C:
+                        sys.stdout.write("\x1b[2J\x1b[H")
+                        self._render(prompt, characters, cursor)
+                    elif value == 0x09:
+                        characters[cursor:cursor] = list("    ")
+                        cursor += 4
+                        self._render(prompt, characters, cursor)
+                    elif value >= 0x20:
+                        decoded = decoder.decode(bytes([value]), final=False)
+                        if decoded:
+                            characters[cursor:cursor] = list(decoded)
+                            cursor += len(decoded)
+                            self._render(prompt, characters, cursor)
+
+            if result is None:
+                raise EOFError
+            if result and (not self._history or self._history[-1] != result):
+                self._history.append(result)
+            return result
+        finally:
+            termios.tcsetattr(input_descriptor, termios.TCSADRAIN, original_terminal)
+            with self._lock:
+                self._input_active = False
+                for message in self._drain_notifications():
+                    self._write_message(message)
+                sys.stdout.flush()
 
 
 @dataclass(frozen=True)
@@ -537,12 +788,13 @@ def print_help(emit: Callable[[str], None] = print) -> None:
 def run_interactive(
     node: UwbNode,
     image_delay: float,
+    console: InteractiveConsole,
     prompt: str = "uwb> ",
 ) -> None:
     print_help(node.emit)
     while True:
         try:
-            command_line = input(prompt).strip()
+            command_line = console.input(prompt).strip()
         except EOFError:
             break
         if not command_line:
@@ -676,11 +928,8 @@ def main() -> int:
         run_self_check()
         return 0
 
-    console_lock = threading.Lock()
-
-    def emit(message: str) -> None:
-        with console_lock:
-            print(message, flush=True)
+    console = InteractiveConsole()
+    emit = console.emit
 
     try:
         image_receiver = ImageReceiver(args.output_dir, emit)
@@ -709,7 +958,7 @@ def main() -> int:
                 else:
                     emit(f"[INFO] Receiving images into {args.output_dir.expanduser()}")
                     prompt = f"{args.name}> " if args.name else "uwb> "
-                    run_interactive(node, args.image_delay, prompt)
+                    run_interactive(node, args.image_delay, console, prompt)
             finally:
                 node.close()
     except KeyboardInterrupt:
@@ -718,6 +967,8 @@ def main() -> int:
     except (OSError, SerialException, UwbNodeError) as error:
         print(f"[ERROR] {error}", file=sys.stderr)
         return 1
+    finally:
+        console.close()
     return 0
 
 
