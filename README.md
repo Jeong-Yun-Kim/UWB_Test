@@ -1,29 +1,38 @@
-# AI Rescue Box UWB Test
+# AI Rescue Box UWB Bidirectional Test
 
-ESP32와 DWM1000을 이용해 **Basecamp Laptop에서 보낸 텍스트와 사진을 Jetson Orin Nano에서 수신**하는 최소 통신 테스트 프로젝트다.
+ESP32와 DWM1000 두 세트로 Basecamp Laptop과 Jetson Orin Nano 사이에서 **텍스트와 사진을 양방향 전송**하는 최소 시험 프로젝트다.
 
 ```text
-Basecamp Laptop
-  → USB Serial → ESP32 + DWM1000 (Sender)
-  → UWB
-  → ESP32 + DWM1000 (Receiver) → USB Serial
-  → Jetson Orin Nano
+Basecamp Laptop ↔ USB Serial ↔ ESP32 + DWM1000
+                                      ↕ UWB
+Jetson Orin Nano ↔ USB Serial ↔ ESP32 + DWM1000
 ```
 
-ROS 2, SLAM, Camera, YOLO, 지도 처리와 GUI는 사용하지 않는다.
+DWM1000은 동시에 송수신하지 않는 **반이중(half-duplex)** 방식이다. 각 패킷은 상대편 ACK를 확인하며, ACK가 없으면 자동 재전송한다. ROS 2, SLAM, 카메라, AI, 지도 처리 및 GUI는 포함하지 않는다.
 
-## 장비 구성
+## 구성
 
-| 장비 | ESP32 PlatformIO 환경 | Python 프로그램 |
+| 장비 | PlatformIO 환경 | 실행 프로그램 |
 |---|---|---|
-| Basecamp Laptop | `uwb_sender` | `jetson/sender.py` |
-| Jetson Orin Nano | `uwb_receiver` | `basecamp/receiver.py` |
+| Basecamp Laptop | `laptop_node` | `host/uwb_node.py` |
+| Jetson Orin Nano | `jetson_node` | `host/uwb_node.py` |
 
-폴더 이름은 최초 개발 방향에서 정해졌기 때문에 현재 장비 역할과 반대로 보일 수 있다. 실제 동작은 `sender.py`가 송신, `receiver.py`가 수신이다.
+두 장비는 같은 Python 프로그램을 사용한다. ESP32 펌웨어의 노드 ID만 서로 다르다.
 
-## DWM1000 배선
+```text
+UWB_Test/
+├── platformio.ini
+├── host/
+│   └── uwb_node.py
+├── esp32/
+│   ├── scripts/
+│   └── src/uwb_node/main.cpp
+└── docs/test_result.md
+```
 
-송신부와 수신부를 똑같이 연결한다.
+## 배선
+
+Laptop 측과 Jetson 측을 동일하게 연결한다.
 
 | DWM1000 | ESP32 |
 |---|---:|
@@ -36,177 +45,157 @@ ROS 2, SLAM, Camera, YOLO, 지도 처리와 GUI는 사용하지 않는다.
 | IRQ | GPIO 27 |
 | RST / RSTn | GPIO 15 |
 
-DWM1000은 반드시 `3.3V`로 연결한다. 코드의 `SPI.begin(18, 19, 23, 2)`에서 GPIO 2는 SPI 객체 설정값이며, 실제 DWM1000 CS 배선은 GPIO 5다.
-
-## 폴더 구조
-
-```text
-UWB_Test/
-├── platformio.ini
-├── jetson/
-│   ├── sender.py
-│   └── requirements.txt
-├── basecamp/
-│   ├── receiver.py
-│   └── requirements.txt
-├── esp32/
-│   ├── scripts/patch_dw1000_esp32.py
-│   └── src/
-│       ├── uwb_sender/main.cpp
-│       └── uwb_receiver/main.cpp
-└── docs/test_result.md
-```
+DWM1000은 반드시 `3.3V`로 연결한다. `SPI.begin(18, 19, 23, 2)`의 GPIO 2는 SPI 객체 설정값이며 실제 CS는 GPIO 5다.
 
 ## 1. 프로젝트 받기
 
-Laptop과 Jetson에서 각각 실행한다.
+Laptop과 Jetson에서 각각 한 번 실행한다.
 
 ```bash
 cd ~
 git clone https://github.com/Jeong-Yun-Kim/UWB_Test.git
+cd ~/UWB_Test
 ```
 
-## 2. ESP32 펌웨어 업로드
-
-Laptop과 Jetson의 VS Code에 `PlatformIO IDE` 확장을 설치하고 `~/UWB_Test` 폴더를 연다.
-
-### Laptop 송신 ESP32
-
-```text
-PlatformIO → PROJECT TASKS → uwb_sender → General → Upload
-```
-
-### Jetson 수신 ESP32
-
-```text
-PlatformIO → PROJECT TASKS → uwb_receiver → General → Upload
-```
-
-두 장비 모두 기본 USB 포트는 `/dev/ttyACM0`이다. 처음 빌드할 때 ESP32 플랫폼과 DW1000 라이브러리를 내려받기 위해 인터넷 연결이 필요할 수 있다.
-
-## 3. Python 설치
-
-최초 한 번만 실행한다.
-
-### Jetson
+이미 받은 프로젝트는 다음 명령으로 갱신한다.
 
 ```bash
-cd ~/UWB_Test/basecamp
-python3 -m venv .venv
-source .venv/bin/activate
-python3 -m pip install -r requirements.txt
+cd ~/UWB_Test
+git pull origin main
 ```
+
+## 2. ESP32 업로드
+
+VS Code에서 `~/UWB_Test`를 열고 PlatformIO IDE 확장을 설치한다. `Upload`는 컴파일과 업로드를 함께 수행하며, 완료 후 ESP32가 자동 실행된다.
 
 ### Laptop
 
+```text
+PlatformIO → PROJECT TASKS → laptop_node → General → Upload
+```
+
+### Jetson
+
+```text
+PlatformIO → PROJECT TASKS → jetson_node → General → Upload
+```
+
+코드를 변경하지 않았다면 전원을 다시 켠 뒤 재업로드할 필요가 없다. Python 실행 전에는 PlatformIO Serial Monitor를 닫는다.
+
+## 3. Python 설치
+
+Laptop과 Jetson에서 각각 한 번 실행한다.
+
 ```bash
-cd ~/UWB_Test/jetson
+cd ~/UWB_Test
 python3 -m venv .venv
 source .venv/bin/activate
-python3 -m pip install -r requirements.txt
+python3 -m pip install -r host/requirements.txt
 ```
 
 ## 4. 실행
 
-항상 **Jetson 수신기를 먼저 실행**하고, `Waiting for UWB data...`가 나오면 Laptop에서 전송한다.
+양쪽 장비에서 각각 실행한다. 기본 포트는 `/dev/ttyACM0`이다.
 
-### Jetson: 수신
-
-```bash
-cd ~/UWB_Test/basecamp
-source .venv/bin/activate
-python3 receiver.py --output-dir ~/uwb_received_images
-```
-
-### Laptop: 텍스트 10개 전송
+### Laptop
 
 ```bash
-cd ~/UWB_Test/jetson
+cd ~/UWB_Test
 source .venv/bin/activate
-python3 sender.py --count 10
+python3 host/uwb_node.py --name laptop --output-dir ~/uwb_received_images
 ```
 
-### Laptop: 사진 전송
+### Jetson
 
 ```bash
-cd ~/UWB_Test/jetson
+cd ~/UWB_Test
 source .venv/bin/activate
-python3 sender.py --image ~/Pictures/test.jpg
+python3 host/uwb_node.py --name jetson --output-dir ~/uwb_received_images
 ```
 
-수신된 사진은 Jetson의 `~/uwb_received_images/`에 저장된다.
-
-## 성공 출력
-
-텍스트가 도착하면 Jetson에 다음처럼 출력된다.
+프롬프트에서 필요한 명령만 입력한다.
 
 ```text
-[RECEIVED]
-HELLO AI RESCUE BOX 001
+text HELLO AI RESCUE BOX
+image /home/user/Pictures/test.jpg
+quit
 ```
 
-사진이 정상적으로 재조립되고 SHA-256 검증을 통과하면 다음처럼 출력된다.
+`text`와 `image`는 Laptop과 Jetson 어느 쪽에서도 사용할 수 있다. 지정한 `~/uwb_received_images` 폴더가 없으면 프로그램이 자동 생성한다.
+
+양쪽 프로그램에 `[INFO] Connected`가 표시된 뒤 전송을 시작한다. 상대 Python 프로그램이 꺼져 있어도 상대 ESP32 자체는 무선 ACK를 보낼 수 있으므로, 최종 텍스트와 사진 도착 여부는 항상 수신 측 출력으로 확인한다.
+
+한 건만 보내고 종료하려면 다음처럼 실행한다.
+
+```bash
+python3 host/uwb_node.py --name laptop --text "HELLO AI RESCUE BOX"
+python3 host/uwb_node.py --name laptop --image ~/Pictures/test.jpg
+```
+
+다른 포트를 사용할 때만 `--port`를 지정한다.
+
+```bash
+python3 host/uwb_node.py --name laptop --port /dev/ttyACM1
+```
+
+## 성공 확인
+
+수신 측에는 원문 또는 저장된 사진 경로가 출력된다. 송신 측의 다음 출력은 **상대편 ESP32가 패킷을 실제 수신해 응답했다는 뜻**이다.
 
 ```text
-[IMAGE SAVED]
-path=/home/user/uwb_received_images/image_1234abcd.jpg
-size=...
-sha256=...
+[UWB ACK]
 ```
 
-Laptop의 `[UWB SENT]`는 송신 ESP32가 로컬 전송을 마쳤다는 뜻이며 Jetson 수신 성공 ACK는 아니다. 최종 성공 여부는 Jetson 출력으로 확인한다.
+`[UWB SENT]`는 로컬 송신 완료일 뿐이고, `[UWB ACK]`가 상대편 ESP32의 수신 확인이다. 사진 송신 측의 `[IMAGE SEND COMPLETE]`는 모든 조각이 무선 ACK를 받았다는 뜻이다. 파일 재조립과 SHA-256 검증까지 성공했는지는 반드시 수신 측의 `[IMAGE SAVED]`로 확인한다.
 
-## 전송 제한
+## 통신 설정과 주의점
 
-| 항목 | 제한 |
+- USB Serial: `460800 baud`
+- UWB: `DW1000.MODE_LONGDATA_FAST_ACCURACY`
+- 무선 데이터율: `6.8 Mbps`, 긴 프리앰블
+- ACK timeout 시 자동 재전송
+- 두 DWM1000은 배선뿐 아니라 UWB 모드와 채널 설정도 반드시 같아야 한다.
+
+고속 모드는 기존 장거리 110 kbps 모드보다 사진 전송에 유리하지만, 거리와 벽이 많은 NLOS 환경에서는 수신 여유가 줄 수 있다. 먼저 1~3 m 가시거리에서 양방향 텍스트를 확인한 뒤 실제 건물에서 거리와 장애물별로 시험한다. 표시되는 6.8 Mbps는 무선 PHY 속도이며 파일의 실제 처리량은 ACK, 프리앰블, 분할 및 재전송 때문에 더 낮다.
+
+| 항목 | 현재 제한 |
 |---|---|
-| 텍스트 | 한 메시지 최대 120바이트 |
+| 텍스트 | UTF-8 기준 한 메시지 최대 111바이트 |
 | 사진 | 최대 10 MiB |
 | 사진 형식 | JPG, JPEG, PNG, WEBP, BMP, GIF, TIF, TIFF |
-| 사진 분할 | 원본 72바이트 단위 |
-| 기본 중복 전송 | 청크당 2회 |
-| 예상 사진 처리량 | 약 0.6~0.7 KiB/s |
 
-첫 시험은 `20~50 KiB` 정도의 작은 JPEG를 권장한다. 큰 사진은 전송 시간이 매우 오래 걸린다.
+## AI Rescue Box 데이터 운용 권장
+
+건물 구조도 전체에 위치와 위험 표시를 합성해 매번 사진으로 보내면 느리고 손실 복구 비용이 크다.
+
+- 건물 베이스맵은 임무 시작 또는 버전 변경 시 한 번만 보낸다.
+- 로봇 위치, 이동 경로, 요구조자 및 위험지역은 작은 좌표/상태 메시지로 보낸다.
+- Basecamp는 받은 좌표를 저장된 베이스맵 위에 표시한다.
+- 현장 사진은 필요할 때만 작은 JPEG/WebP 썸네일로 보낸다.
+- 긴급정보와 위치정보가 지도나 사진보다 먼저 전송되도록 한다.
+
+현재 최소 시험 코드는 우선순위 큐를 구현하지 않는다. 한 터미널에서 사진을 보내는 동안 그 터미널의 새 `text` 명령 입력은 사진 전송이 끝날 때까지 기다린다.
 
 ## 문제 해결
 
-### Serial Port 확인
+포트 확인:
 
 ```bash
 python3 -m serial.tools.list_ports -v
 ```
 
-### Serial 권한 오류
+권한 오류:
 
 ```bash
 sudo usermod -aG dialout "$USER"
 ```
 
-명령 실행 후 로그아웃하고 다시 로그인한다.
-
-### Port busy
-
-PlatformIO Serial Monitor를 닫고 점유 프로그램을 확인한다.
+명령 실행 후 로그아웃하고 다시 로그인한다. 포트가 사용 중이면 PlatformIO Serial Monitor와 다른 송수신 프로그램을 닫고 확인한다.
 
 ```bash
 lsof /dev/ttyACM0
 ```
 
-PlatformIO Monitor와 Python 프로그램은 `/dev/ttyACM0`을 동시에 사용할 수 없다.
+ACK가 계속 오지 않으면 양쪽 펌웨어 역할, 3.3V/GND, IRQ 27, CS 5, RST 15, 안테나 방향과 양쪽 UWB 모드 일치를 확인한다.
 
-### 사진이 불완전하게 수신될 때
-
-Laptop에서 반복 횟수를 늘려 다시 전송한다.
-
-```bash
-python3 sender.py --image ~/Pictures/test.jpg --repeat 3
-```
-
-### 송신은 완료됐지만 Jetson에 출력이 없을 때
-
-두 보드의 `3.3V`, GND, IRQ 27, CS 5, RST 15 배선과 안테나 방향을 확인하고 처음에는 1~3 m 가시거리에서 시험한다.
-
-## 테스트 기록
-
-실제 하드웨어 시험 결과는 [`docs/test_result.md`](docs/test_result.md)에 기록한다.
+시험 결과는 [`docs/test_result.md`](docs/test_result.md)에 기록한다.
