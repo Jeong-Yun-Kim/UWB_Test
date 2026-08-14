@@ -11,7 +11,6 @@
 #error "PEER_ID must be supplied by platformio.ini"
 #endif
 
-// Keep this wiring identical to the working AI Rescue Box DWM1000 baseline.
 constexpr uint8_t PIN_RST = 15;
 constexpr uint8_t PIN_IRQ = 27;
 constexpr uint8_t PIN_SS = 5;
@@ -28,39 +27,29 @@ constexpr uint8_t REMOTE_NODE_ID = PEER_ID;
 
 constexpr size_t MAX_UWB_FRAME_SIZE = 120;
 constexpr size_t FRAME_HEADER_SIZE = 9;
-constexpr size_t MAX_APP_PAYLOAD_SIZE =
-    MAX_UWB_FRAME_SIZE - FRAME_HEADER_SIZE;
+constexpr size_t MAX_APP_PAYLOAD_SIZE = MAX_UWB_FRAME_SIZE - FRAME_HEADER_SIZE;
 
 constexpr uint8_t FRAME_MAGIC_0 = 0xA1;
 constexpr uint8_t FRAME_MAGIC_1 = 0x52;
 constexpr uint8_t PROTOCOL_VERSION = 1;
 
-constexpr uint8_t MAX_RETRIES = 4;
-constexpr uint8_t MAX_SEND_ATTEMPTS = 1 + MAX_RETRIES;
-// The known-good legacy radio mode is 110 kbps with a long preamble. Give the
-// peer enough time to turn the half-duplex radio around and return its ACK.
-constexpr uint32_t ACK_TIMEOUT_MS = 200;
-constexpr uint32_t TX_WATCHDOG_MS = 300;
-constexpr uint32_t RETRY_BACKOFF_MIN_MS = 10;
-constexpr uint32_t RETRY_BACKOFF_MAX_MS = 50;
+constexpr uint8_t MAX_SEND_ATTEMPTS = 5;
+constexpr uint32_t ACK_TIMEOUT_MS = 250;
+constexpr uint32_t TX_TIMEOUT_MS = 300;
+constexpr uint32_t RETRY_BACKOFF_MIN_MS = 15;
+constexpr uint32_t RETRY_BACKOFF_MAX_MS = 70;
 constexpr size_t DUPLICATE_HISTORY_SIZE = 32;
 
+static_assert(MAX_APP_PAYLOAD_SIZE == 111,
+              "The radio header must leave 111 payload bytes");
 static_assert(LOCAL_NODE_ID > 0 && REMOTE_NODE_ID > 0,
               "Node IDs must be non-zero");
 static_assert(LOCAL_NODE_ID != REMOTE_NODE_ID,
-              "Local and peer IDs must be different");
-static_assert(MAX_APP_PAYLOAD_SIZE == 111,
-              "The binary protocol header must leave 111 payload bytes");
+              "Local and peer IDs must differ");
 
 enum class FrameType : uint8_t {
   Data = 1,
   Ack = 2,
-};
-
-enum class TransmitPurpose : uint8_t {
-  None,
-  Data,
-  Ack,
 };
 
 struct ParsedFrame {
@@ -72,43 +61,28 @@ struct ParsedFrame {
   const byte *payload;
 };
 
-struct OutboundMessage {
-  bool active = false;
-  bool waitingForAck = false;
-  bool sendScheduled = false;
-  uint16_t sequence = 0;
-  uint8_t payloadLength = 0;
-  uint8_t attempts = 0;
-  uint32_t deadline = 0;
-  byte payload[MAX_APP_PAYLOAD_SIZE] = {};
-};
+// DW1000 v0.9 adds two FCS bytes inside setData(). Keep two readable safety
+// bytes after the application frame, matching the known-good legacy sender.
+byte txBuffer[MAX_UWB_FRAME_SIZE + 2] = {};
+byte rxBuffer[MAX_UWB_FRAME_SIZE] = {};
 
-// DW1000 v0.9's byte-array setData() accounts for two hardware FCS bytes.
-// Keep two accessible safety bytes after every UWB frame.
-byte radioTransmitBuffer[MAX_UWB_FRAME_SIZE + 2] = {};
-byte radioReceiveBuffer[MAX_UWB_FRAME_SIZE] = {};
-
-// Allow one extra byte so a maximum-sized line followed by CRLF is accepted.
+// One extra byte allows 111 payload bytes followed by CR before LF.
 byte serialBuffer[MAX_APP_PAYLOAD_SIZE + 1] = {};
 size_t serialLength = 0;
 bool discardSerialLine = false;
 
-OutboundMessage outbound;
-TransmitPurpose transmitPurpose = TransmitPurpose::None;
-bool radioTransmitActive = false;
-uint32_t radioTransmitStartedAt = 0;
-
-bool pendingAck = false;
-uint16_t pendingAckSequence = 0;
+volatile bool sentEvent = false;
+volatile bool receivedEvent = false;
+volatile bool receiveFailedEvent = false;
 
 uint16_t nextSequence = 0;
 uint16_t deliveredSequences[DUPLICATE_HISTORY_SIZE] = {};
 size_t deliveredSequenceCount = 0;
 size_t deliveredSequenceCursor = 0;
 
-volatile bool interruptSent = false;
-volatile bool interruptReceived = false;
-volatile bool interruptReceiveFailed = false;
+bool outboundActive = false;
+uint16_t outboundSequence = 0;
+bool outboundAckSeen = false;
 
 
 bool deadlineReached(uint32_t now, uint32_t deadline) {
@@ -117,29 +91,37 @@ bool deadlineReached(uint32_t now, uint32_t deadline) {
 
 
 void handleSent() {
-  interruptSent = true;
+  sentEvent = true;
 }
 
 
 void handleReceived() {
-  interruptReceived = true;
+  receivedEvent = true;
 }
 
 
 void handleReceiveFailed() {
-  // DW1000.receivePermanently(true) re-arms RX in the library ISR. Keep a
-  // lightweight flag only so the main loop can clear the event without
-  // resetting a radio that is otherwise healthy.
-  interruptReceiveFailed = true;
+  receiveFailedEvent = true;
 }
 
 
-void clearInterruptFlags() {
+void clearEvents() {
   noInterrupts();
-  interruptSent = false;
-  interruptReceived = false;
-  interruptReceiveFailed = false;
+  sentEvent = false;
+  receivedEvent = false;
+  receiveFailedEvent = false;
   interrupts();
+}
+
+
+void startReceiver() {
+  // Follow the library's own MessagePingPong/legacy receiver pattern. Once
+  // permanent receive is enabled, startTransmit() automatically returns the
+  // DW1000 to RX after each DATA or ACK transmission.
+  DW1000.newReceive();
+  DW1000.setDefaults();
+  DW1000.receivePermanently(true);
+  DW1000.startReceive();
 }
 
 
@@ -149,21 +131,14 @@ void configureRadio() {
   DW1000.setDeviceAddress(LOCAL_NODE_ID);
   DW1000.setNetworkId(UWB_NETWORK_ID);
 
-  // This is intentionally the same radio mode used by the legacy
-  // uwb_sender/uwb_receiver firmware that was verified on this hardware.
+  // This is the mode that just passed the real Host -> Jetson hardware test.
   DW1000.enableMode(DW1000.MODE_LONGDATA_RANGE_LOWPOWER);
-  DW1000.setChannel(DW1000.CHANNEL_5);
   DW1000.commitConfiguration();
 
   DW1000.attachSentHandler(handleSent);
   DW1000.attachReceivedHandler(handleReceived);
   DW1000.attachReceiveFailedHandler(handleReceiveFailed);
-
-  // The known-good receiver used permanent RX. Keeping it enabled also lets
-  // DW1000 v0.9 return to receive mode automatically after each DATA/ACK TX.
-  DW1000.newReceive();
-  DW1000.receivePermanently(true);
-  DW1000.startReceive();
+  startReceiver();
 }
 
 
@@ -176,13 +151,7 @@ void announceReady() {
 
 
 void recoverRadio() {
-  radioTransmitActive = false;
-  transmitPurpose = TransmitPurpose::None;
-  pendingAck = false;
-  clearInterruptFlags();
-
-  // select() performs the same hard-reset/LDE reload path used during the
-  // working baseline initialization.
+  clearEvents();
   DW1000.select(PIN_SS);
   configureRadio();
   announceReady();
@@ -191,64 +160,40 @@ void recoverRadio() {
 
 size_t buildFrame(FrameType type, uint16_t sequence,
                   const byte *payload, uint8_t payloadLength) {
-  memset(radioTransmitBuffer, 0, sizeof(radioTransmitBuffer));
-  radioTransmitBuffer[0] = FRAME_MAGIC_0;
-  radioTransmitBuffer[1] = FRAME_MAGIC_1;
-  radioTransmitBuffer[2] = PROTOCOL_VERSION;
-  radioTransmitBuffer[3] = static_cast<uint8_t>(type);
-  radioTransmitBuffer[4] = LOCAL_NODE_ID;
-  radioTransmitBuffer[5] = REMOTE_NODE_ID;
-  radioTransmitBuffer[6] = static_cast<uint8_t>(sequence & 0xFF);
-  radioTransmitBuffer[7] = static_cast<uint8_t>(sequence >> 8);
-  radioTransmitBuffer[8] = payloadLength;
+  memset(txBuffer, 0, sizeof(txBuffer));
+  txBuffer[0] = FRAME_MAGIC_0;
+  txBuffer[1] = FRAME_MAGIC_1;
+  txBuffer[2] = PROTOCOL_VERSION;
+  txBuffer[3] = static_cast<uint8_t>(type);
+  txBuffer[4] = LOCAL_NODE_ID;
+  txBuffer[5] = REMOTE_NODE_ID;
+  txBuffer[6] = static_cast<uint8_t>(sequence & 0xFF);
+  txBuffer[7] = static_cast<uint8_t>((sequence >> 8) & 0xFF);
+  txBuffer[8] = payloadLength;
 
   if (payloadLength > 0 && payload != nullptr) {
-    memcpy(radioTransmitBuffer + FRAME_HEADER_SIZE, payload, payloadLength);
+    memcpy(txBuffer + FRAME_HEADER_SIZE, payload, payloadLength);
   }
   return FRAME_HEADER_SIZE + payloadLength;
 }
 
 
-bool startRadioTransmit(FrameType type, uint16_t sequence,
-                        const byte *payload, uint8_t payloadLength,
-                        TransmitPurpose purpose) {
-  if (radioTransmitActive || payloadLength > MAX_APP_PAYLOAD_SIZE) {
-    return false;
-  }
-
-  const size_t frameLength = buildFrame(type, sequence, payload, payloadLength);
-
-  noInterrupts();
-  interruptSent = false;
-  interrupts();
-
-  DW1000.newTransmit();
-  DW1000.setData(radioTransmitBuffer, frameLength);
-
-  transmitPurpose = purpose;
-  radioTransmitActive = true;
-  radioTransmitStartedAt = millis();
-  DW1000.startTransmit();
-  return true;
-}
-
-
-bool parseFrame(const byte *frame, size_t frameLength, ParsedFrame &parsed) {
+bool parseFrame(size_t frameLength, ParsedFrame &frame) {
   if (frameLength < FRAME_HEADER_SIZE || frameLength > MAX_UWB_FRAME_SIZE) {
     return false;
   }
-  if (frame[0] != FRAME_MAGIC_0 || frame[1] != FRAME_MAGIC_1 ||
-      frame[2] != PROTOCOL_VERSION) {
+  if (rxBuffer[0] != FRAME_MAGIC_0 || rxBuffer[1] != FRAME_MAGIC_1 ||
+      rxBuffer[2] != PROTOCOL_VERSION) {
     return false;
   }
 
-  const uint8_t rawType = frame[3];
+  const uint8_t rawType = rxBuffer[3];
   if (rawType != static_cast<uint8_t>(FrameType::Data) &&
       rawType != static_cast<uint8_t>(FrameType::Ack)) {
     return false;
   }
 
-  const uint8_t payloadLength = frame[8];
+  const uint8_t payloadLength = rxBuffer[8];
   if (payloadLength > MAX_APP_PAYLOAD_SIZE ||
       frameLength != FRAME_HEADER_SIZE + payloadLength) {
     return false;
@@ -260,13 +205,13 @@ bool parseFrame(const byte *frame, size_t frameLength, ParsedFrame &parsed) {
     return false;
   }
 
-  parsed.type = static_cast<FrameType>(rawType);
-  parsed.source = frame[4];
-  parsed.destination = frame[5];
-  parsed.sequence = static_cast<uint16_t>(frame[6]) |
-                    (static_cast<uint16_t>(frame[7]) << 8);
-  parsed.payloadLength = payloadLength;
-  parsed.payload = frame + FRAME_HEADER_SIZE;
+  frame.type = static_cast<FrameType>(rawType);
+  frame.source = rxBuffer[4];
+  frame.destination = rxBuffer[5];
+  frame.sequence = static_cast<uint16_t>(rxBuffer[6]) |
+                   (static_cast<uint16_t>(rxBuffer[7]) << 8);
+  frame.payloadLength = payloadLength;
+  frame.payload = rxBuffer + FRAME_HEADER_SIZE;
   return true;
 }
 
@@ -291,51 +236,52 @@ void rememberDelivered(uint16_t sequence) {
 }
 
 
-void finishOutboundSuccess() {
-  outbound.active = false;
-  outbound.waitingForAck = false;
-  outbound.sendScheduled = false;
-  Serial.println(F("[UWB ACK]"));
-}
-
-
-void finishOutboundFailure(const __FlashStringHelper *reason) {
-  outbound.active = false;
-  outbound.waitingForAck = false;
-  outbound.sendScheduled = false;
-  Serial.print(F("[UWB ERROR] "));
-  Serial.println(reason);
-}
-
-
-void scheduleRetry() {
-  outbound.waitingForAck = false;
-  if (outbound.attempts >= MAX_SEND_ATTEMPTS) {
-    finishOutboundFailure(F("ack timeout"));
-    return;
+bool radioSend(FrameType type, uint16_t sequence,
+               const byte *payload, uint8_t payloadLength) {
+  if (payloadLength > MAX_APP_PAYLOAD_SIZE) {
+    return false;
   }
 
-  const uint32_t backoff =
-      static_cast<uint32_t>(random(RETRY_BACKOFF_MIN_MS,
-                                   RETRY_BACKOFF_MAX_MS + 1));
-  Serial.print(F("[UWB RETRY] attempt="));
-  Serial.println(outbound.attempts + 1);
-  outbound.sendScheduled = true;
-  outbound.deadline = millis() + backoff;
+  const size_t frameLength = buildFrame(type, sequence, payload, payloadLength);
+
+  noInterrupts();
+  sentEvent = false;
+  interrupts();
+
+  // Keep TX switching as close as possible to the working legacy sender and
+  // the library's MessagePingPong example.
+  DW1000.newTransmit();
+  DW1000.setDefaults();
+  DW1000.setData(txBuffer, frameLength);
+  DW1000.startTransmit();
+
+  const uint32_t deadline = millis() + TX_TIMEOUT_MS;
+  while (true) {
+    bool sent = false;
+    noInterrupts();
+    sent = sentEvent;
+    if (sent) {
+      sentEvent = false;
+    }
+    interrupts();
+
+    if (sent) {
+      return true;
+    }
+    if (deadlineReached(millis(), deadline)) {
+      Serial.println(F("[UWB TX TIMEOUT]"));
+      recoverRadio();
+      return false;
+    }
+    delay(1);
+  }
 }
 
 
-void queueOutbound(const byte *payload, uint8_t payloadLength) {
-  outbound.active = true;
-  outbound.waitingForAck = false;
-  outbound.sendScheduled = true;
-  outbound.sequence = nextSequence++;
-  outbound.payloadLength = payloadLength;
-  outbound.attempts = 0;
-  memcpy(outbound.payload, payload, payloadLength);
-
-  // De-synchronise two nodes that happen to submit a line at the same time.
-  outbound.deadline = millis() + static_cast<uint32_t>(random(2, 12));
+void sendAck(uint16_t sequence) {
+  // ACK delivery itself is best effort. If it is lost, the sender retransmits
+  // the same DATA sequence and this node will ACK the duplicate again.
+  radioSend(FrameType::Ack, sequence, nullptr, 0);
 }
 
 
@@ -345,18 +291,19 @@ void processReceivedFrame() {
     return;
   }
 
-  DW1000.getData(radioReceiveBuffer, frameLength);
+  DW1000.getData(rxBuffer, frameLength);
 
   ParsedFrame frame{};
-  if (!parseFrame(radioReceiveBuffer, frameLength, frame) ||
-      frame.source != REMOTE_NODE_ID ||
-      frame.destination != LOCAL_NODE_ID) {
+  if (!parseFrame(frameLength, frame)) {
+    return;
+  }
+  if (frame.source != REMOTE_NODE_ID || frame.destination != LOCAL_NODE_ID) {
     return;
   }
 
   if (frame.type == FrameType::Ack) {
-    if (outbound.active && frame.sequence == outbound.sequence) {
-      finishOutboundSuccess();
+    if (outboundActive && frame.sequence == outboundSequence) {
+      outboundAckSeen = true;
     }
     return;
   }
@@ -368,104 +315,98 @@ void processReceivedFrame() {
     Serial.write('\n');
   }
 
-  // ACK every valid DATA frame, including a duplicate whose previous ACK was
-  // lost. The peer is stop-and-wait, so one queued ACK is sufficient.
-  pendingAck = true;
-  pendingAckSequence = frame.sequence;
+  sendAck(frame.sequence);
 }
 
 
-void processRadioEvents() {
-  bool sent = false;
+void pumpRadio() {
   bool received = false;
   bool receiveFailed = false;
 
   noInterrupts();
-  sent = interruptSent;
-  received = interruptReceived;
-  receiveFailed = interruptReceiveFailed;
-  interruptSent = false;
-  interruptReceived = false;
-  interruptReceiveFailed = false;
+  received = receivedEvent;
+  receiveFailed = receiveFailedEvent;
+  receivedEvent = false;
+  receiveFailedEvent = false;
   interrupts();
-
-  // TX completion first: an ACK may arrive immediately after DATA and both
-  // flags can be pending by the time the loop runs.
-  if (sent) {
-    const TransmitPurpose completedPurpose = transmitPurpose;
-    radioTransmitActive = false;
-    transmitPurpose = TransmitPurpose::None;
-
-    if (completedPurpose == TransmitPurpose::Data && outbound.active) {
-      outbound.waitingForAck = true;
-      outbound.deadline = millis() + ACK_TIMEOUT_MS;
-    }
-  }
 
   if (received) {
     processReceivedFrame();
   }
 
-  // Permanent receive is already re-armed by DW1000 v0.9's ISR. Do not call
-  // newReceive() here; doing so can race the next valid frame.
+  // DW1000 v0.9 automatically re-arms permanent RX inside its interrupt
+  // handler. Do not reset/reconfigure the radio for ordinary RX failures.
   (void)receiveFailed;
 }
 
 
-void processPendingAck() {
-  if (!pendingAck || radioTransmitActive) {
-    return;
+bool waitForAck(uint16_t sequence, uint32_t timeoutMs) {
+  const uint32_t deadline = millis() + timeoutMs;
+  while (!deadlineReached(millis(), deadline)) {
+    pumpRadio();
+    if (outboundActive && outboundSequence == sequence && outboundAckSeen) {
+      return true;
+    }
+    delay(1);
   }
-
-  const uint16_t sequence = pendingAckSequence;
-  if (startRadioTransmit(FrameType::Ack, sequence, nullptr, 0,
-                         TransmitPurpose::Ack)) {
-    pendingAck = false;
-  }
+  pumpRadio();
+  return outboundActive && outboundSequence == sequence && outboundAckSeen;
 }
 
 
-void processTransmitWatchdog() {
-  if (!radioTransmitActive ||
-      !deadlineReached(millis(), radioTransmitStartedAt + TX_WATCHDOG_MS)) {
-    return;
+bool waitBackoffForLateAck(uint16_t sequence, uint32_t delayMs) {
+  const uint32_t deadline = millis() + delayMs;
+  while (!deadlineReached(millis(), deadline)) {
+    pumpRadio();
+    if (outboundActive && outboundSequence == sequence && outboundAckSeen) {
+      return true;
+    }
+    delay(1);
   }
-
-  const bool dataWasTransmitting =
-      transmitPurpose == TransmitPurpose::Data && outbound.active;
-
-  Serial.println(F("[UWB TX TIMEOUT]"));
-  recoverRadio();
-
-  if (dataWasTransmitting && outbound.active) {
-    scheduleRetry();
-  }
+  return outboundActive && outboundSequence == sequence && outboundAckSeen;
 }
 
 
-void processOutboundState() {
-  if (!outbound.active) {
-    return;
-  }
+void sendPayloadWithAck(const byte *payload, uint8_t payloadLength) {
+  const uint16_t sequence = nextSequence++;
+  outboundActive = true;
+  outboundSequence = sequence;
+  outboundAckSeen = false;
 
-  const uint32_t now = millis();
+  for (uint8_t attempt = 1; attempt <= MAX_SEND_ATTEMPTS; ++attempt) {
+    if (attempt > 1) {
+      Serial.print(F("[UWB RETRY] attempt="));
+      Serial.println(attempt);
+      const uint32_t backoff = static_cast<uint32_t>(
+          random(RETRY_BACKOFF_MIN_MS, RETRY_BACKOFF_MAX_MS + 1));
+      if (waitBackoffForLateAck(sequence, backoff)) {
+        break;
+      }
+    }
 
-  if (outbound.waitingForAck && deadlineReached(now, outbound.deadline)) {
-    scheduleRetry();
-  }
+    // Service any peer DATA before changing this radio from RX to TX.
+    pumpRadio();
+    if (outboundAckSeen) {
+      break;
+    }
 
-  // Receiver ACKs always take priority over our next DATA attempt.
-  if (outbound.active && outbound.sendScheduled &&
-      !radioTransmitActive && !pendingAck &&
-      deadlineReached(now, outbound.deadline)) {
-    if (startRadioTransmit(FrameType::Data, outbound.sequence,
-                           outbound.payload, outbound.payloadLength,
-                           TransmitPurpose::Data)) {
-      outbound.attempts++;
-      outbound.sendScheduled = false;
-      outbound.waitingForAck = false;
+    if (!radioSend(FrameType::Data, sequence, payload, payloadLength)) {
+      continue;
+    }
+
+    if (waitForAck(sequence, ACK_TIMEOUT_MS)) {
+      break;
     }
   }
+
+  if (outboundAckSeen) {
+    Serial.println(F("[UWB ACK]"));
+  } else {
+    Serial.println(F("[UWB ERROR] ack timeout"));
+  }
+
+  outboundActive = false;
+  outboundAckSeen = false;
 }
 
 
@@ -474,6 +415,7 @@ void finishSerialLine() {
       serialBuffer[serialLength - 1] == '\r') {
     serialLength--;
   }
+
   if (serialLength > MAX_APP_PAYLOAD_SIZE) {
     discardSerialLine = true;
   }
@@ -481,7 +423,7 @@ void finishSerialLine() {
   if (discardSerialLine) {
     Serial.println(F("[UWB ERROR] payload too long"));
   } else if (serialLength > 0) {
-    queueOutbound(serialBuffer, static_cast<uint8_t>(serialLength));
+    sendPayloadWithAck(serialBuffer, static_cast<uint8_t>(serialLength));
   }
 
   serialLength = 0;
@@ -490,13 +432,7 @@ void finishSerialLine() {
 
 
 void processSerialInput() {
-  // Stop-and-wait: leave extra lines in the USB Serial buffer until this
-  // message receives a peer ACK or reaches the retry limit.
-  if (outbound.active) {
-    return;
-  }
-
-  while (Serial.available() > 0 && !outbound.active) {
+  while (Serial.available() > 0) {
     const byte incoming = static_cast<byte>(Serial.read());
     if (incoming == '\n') {
       finishSerialLine();
@@ -517,21 +453,16 @@ void setup() {
   randomSeed(esp_random());
   nextSequence = static_cast<uint16_t>(esp_random());
 
-  // GPIO 2 is the SPI object's SS parameter; DWM1000 CS remains GPIO 5.
   SPI.begin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_SPI_SS);
   DW1000.begin(PIN_IRQ, PIN_RST);
   DW1000.select(PIN_SS);
   configureRadio();
-
   announceReady();
 }
 
 
 void loop() {
-  processRadioEvents();
-  processPendingAck();
-  processTransmitWatchdog();
-  processOutboundState();
+  pumpRadio();
   processSerialInput();
   delay(1);
 }
