@@ -26,6 +26,15 @@ constexpr uint16_t UWB_NETWORK_ID = 10;
 constexpr uint8_t LOCAL_NODE_ID = NODE_ID;
 constexpr uint8_t REMOTE_NODE_ID = PEER_ID;
 
+// IMPORTANT: the legacy hardware tests established an asymmetric DW1000
+// address contract. A frame is reliable when the radio currently transmitting
+// uses short address 1 and the radio currently receiving uses short address 2.
+// Reversing those short addresses (TX=2, RX=1) failed even with the legacy
+// one-way firmware. Logical Host/Jetson identity therefore stays in our own
+// link header below; the DW1000 PANADR short address follows the RADIO ROLE.
+constexpr uint16_t TX_DEVICE_ADDRESS = 1;
+constexpr uint16_t RX_DEVICE_ADDRESS = 2;
+
 // USB-side contract used by AI Rescue Box FirmwareLineTransport.
 constexpr size_t MAX_APP_PAYLOAD_SIZE = 111;
 
@@ -134,16 +143,15 @@ void clearIrqFlags() {
 }
 
 
-// Rebuild the complete radio configuration from a hardware reset. This is
-// intentionally conservative: each TX/RX role starts from the same state as
-// the legacy fixed-role programs that passed on the real hardware.
-void configureFreshRadio() {
+// Rebuild the complete radio configuration from a hardware reset. The short
+// address is selected by the current RADIO ROLE, not by Host/Jetson identity.
+void configureFreshRadio(uint16_t deviceAddress) {
   clearIrqFlags();
   DW1000.select(PIN_SS);
 
   DW1000.newConfiguration();
   DW1000.setDefaults();
-  DW1000.setDeviceAddress(LOCAL_NODE_ID);
+  DW1000.setDeviceAddress(deviceAddress);
   DW1000.setNetworkId(UWB_NETWORK_ID);
   DW1000.enableMode(DW1000.MODE_LONGDATA_RANGE_LOWPOWER);
 
@@ -165,7 +173,8 @@ void enterReceiveMode() {
   txKind = TxKind::None;
   receiverArmed = false;
 
-  configureFreshRadio();
+  // Empirically proven legacy receiver address.
+  configureFreshRadio(RX_DEVICE_ADDRESS);
   DW1000.newReceive();
   DW1000.setDefaults();
   DW1000.receivePermanently(false);
@@ -178,7 +187,11 @@ void announceReady() {
   Serial.print(F("[UWB READY] node="));
   Serial.print(LOCAL_NODE_ID);
   Serial.print(F(" peer="));
-  Serial.println(REMOTE_NODE_ID);
+  Serial.print(REMOTE_NODE_ID);
+  Serial.print(F(" tx_addr="));
+  Serial.print(TX_DEVICE_ADDRESS);
+  Serial.print(F(" rx_addr="));
+  Serial.println(RX_DEVICE_ADDRESS);
 }
 
 
@@ -270,10 +283,10 @@ bool startFreshTransmit(uint8_t type, uint16_t sequence,
 
   const size_t frameLength = buildFrame(type, sequence, payload, payloadLength);
 
-  // A complete reset here deliberately avoids depending on a previous RX/TX
-  // state transition. It trades throughput for a known-good radio state.
+  // Every DATA and ACK transmitter uses the empirically proven legacy sender
+  // short address, regardless of whether this physical node is Host or Jetson.
   receiverArmed = false;
-  configureFreshRadio();
+  configureFreshRadio(TX_DEVICE_ADDRESS);
   DW1000.newTransmit();
   DW1000.setDefaults();
   DW1000.setData(radioTxBuffer, static_cast<uint16_t>(frameLength));
@@ -389,12 +402,13 @@ void processRadioEvents() {
     txKind = TxKind::None;
 
     if (completedKind == TxKind::Data && outboundActive) {
-      // Reinitialize as a known-good receiver before the peer sends its ACK.
+      // A DATA sender immediately becomes the proven address-2 receiver so it
+      // can hear the peer's address-1 ACK.
       enterReceiveMode();
       outboundWaitingForAck = true;
       outboundDeadline = millis() + ACK_TIMEOUT_MS;
     } else {
-      // ACK sender also returns to a clean receive state.
+      // ACK sender also returns to the proven receive role.
       enterReceiveMode();
     }
   }
