@@ -26,22 +26,21 @@ constexpr uint8_t LOCAL_NODE_ID = NODE_ID;
 constexpr uint8_t REMOTE_NODE_ID = PEER_ID;
 
 // AI Rescue Box currently sends at most 111 application bytes per USB line.
-// The proven legacy radio path carried raw payload bytes without an extra
-// binary wrapper, so keep DATA frames raw on the air as well.
+// DATA remains raw over RF because this exact raw path was verified with the
+// legacy sender/receiver firmware on the current hardware.
 constexpr size_t MAX_APP_PAYLOAD_SIZE = 111;
 constexpr size_t MAX_RF_PAYLOAD_SIZE = 120;
 
-// Internal RF-only acknowledgement token. It is never forwarded to the host.
-// FirmwareLineTransport still sees the existing USB-side "[UWB ACK]" string.
+// RF-only acknowledgement. This is never forwarded to the USB host.
 constexpr char RF_ACK_TOKEN[] = "~AI_RB_ACK~";
 constexpr size_t RF_ACK_TOKEN_LENGTH = sizeof(RF_ACK_TOKEN) - 1;
 
 constexpr uint8_t MAX_RETRIES = 4;
 constexpr uint8_t MAX_SEND_ATTEMPTS = 1 + MAX_RETRIES;
-constexpr uint32_t ACK_TIMEOUT_MS = 250;
-constexpr uint32_t TX_WATCHDOG_MS = 500;
-constexpr uint32_t RETRY_BACKOFF_MIN_MS = 15;
-constexpr uint32_t RETRY_BACKOFF_MAX_MS = 70;
+constexpr uint32_t ACK_TIMEOUT_MS = 300;
+constexpr uint32_t TX_WATCHDOG_MS = 1000;
+constexpr uint32_t RETRY_BACKOFF_MIN_MS = 20;
+constexpr uint32_t RETRY_BACKOFF_MAX_MS = 100;
 
 static_assert(LOCAL_NODE_ID > 0 && REMOTE_NODE_ID > 0,
               "Node IDs must be non-zero");
@@ -50,8 +49,8 @@ static_assert(LOCAL_NODE_ID != REMOTE_NODE_ID,
 static_assert(RF_ACK_TOKEN_LENGTH <= MAX_RF_PAYLOAD_SIZE,
               "ACK token must fit in one UWB frame");
 
-// DW1000 v0.9's byte-array setData() accounts for the two hardware FCS bytes
-// while copying. Keep two valid safety bytes after the requested RF payload.
+// DW1000 v0.9 accesses the hardware FCS bytes around the requested payload.
+// Keep two accessible safety bytes after every transmit payload.
 byte radioTxBuffer[MAX_RF_PAYLOAD_SIZE + 2] = {};
 byte radioRxBuffer[MAX_RF_PAYLOAD_SIZE] = {};
 
@@ -113,10 +112,8 @@ void clearIrqFlags() {
 }
 
 
-void startReceiver() {
+void startPermanentReceiver() {
   DW1000.newReceive();
-  // This matches the receiver behavior that was verified to work on the
-  // current ESP32 + DWM1000 hardware.
   DW1000.receivePermanently(true);
   DW1000.startReceive();
 }
@@ -127,14 +124,21 @@ void configureRadio() {
   DW1000.setDefaults();
   DW1000.setDeviceAddress(LOCAL_NODE_ID);
   DW1000.setNetworkId(UWB_NETWORK_ID);
-  // Keep the exact radio mode from the working legacy sender/receiver pair.
+
+  // Same radio mode as the legacy sender/receiver pair that works in both
+  // directions on this exact ESP32 + DWM1000 hardware.
   DW1000.enableMode(DW1000.MODE_LONGDATA_RANGE_LOWPOWER);
   DW1000.commitConfiguration();
 
   DW1000.attachSentHandler(handleSent);
   DW1000.attachReceivedHandler(handleReceived);
   DW1000.attachReceiveFailedHandler(handleReceiveFailed);
-  startReceiver();
+
+  // IMPORTANT: leave permanent receive enabled for the lifetime of the radio.
+  // DW1000::startTransmit() automatically re-enters RX when this flag is true.
+  // This is the same turn-around pattern used by the library MessagePingPong
+  // example and avoids the broken manual RX->TX->RX transition seen earlier.
+  startPermanentReceiver();
 }
 
 
@@ -167,14 +171,12 @@ bool startRawTransmit(const byte *payload, size_t payloadLength, TxKind kind) {
   memset(radioTxBuffer, 0, sizeof(radioTxBuffer));
   memcpy(radioTxBuffer, payload, payloadLength);
 
-  // Explicit half-duplex turn-around: stop permanent RX before TX, then
-  // return to the known-good receiver path from the sent callback.
-  DW1000.receivePermanently(false);
-
   noInterrupts();
   irqSent = false;
   interrupts();
 
+  // Do NOT disable receivePermanently here. With it left enabled, the DW1000
+  // library starts RX again automatically immediately after starting TX.
   DW1000.newTransmit();
   DW1000.setData(radioTxBuffer, static_cast<uint16_t>(payloadLength));
 
@@ -235,7 +237,7 @@ void queueOutbound(const byte *payload, uint8_t payloadLength) {
   outboundWaitingForAck = false;
   outboundSendScheduled = true;
   outboundAttempts = 0;
-  outboundDeadline = millis() + static_cast<uint32_t>(random(2, 12));
+  outboundDeadline = millis() + static_cast<uint32_t>(random(3, 20));
 }
 
 
@@ -254,10 +256,11 @@ void processReceivedPacket() {
     return;
   }
 
-  // DATA is deliberately raw: forward exactly what the known-good legacy
-  // receiver would have delivered, then ACK it over the RF link.
+  // Raw DATA path: exactly what the verified legacy receiver delivered.
   Serial.write(radioRxBuffer, payloadLength);
   Serial.write('\n');
+
+  // Queue a short RF ACK. It gets priority over any local DATA retry.
   pendingAck = true;
 }
 
@@ -281,20 +284,21 @@ void processRadioEvents() {
     txActive = false;
     txKind = TxKind::None;
 
-    startReceiver();
-
+    // No manual receiver restart here. Because permanent RX stayed enabled,
+    // DW1000::startTransmit() already put the hardware back into RX.
     if (completedKind == TxKind::Data && outboundActive) {
       outboundWaitingForAck = true;
       outboundDeadline = millis() + ACK_TIMEOUT_MS;
     }
   }
 
+  // A receive interrupt can be pending together with sent. Handle sent first
+  // so txActive is cleared, then consume the received packet.
   if (received && !txActive) {
     processReceivedPacket();
   }
 
-  // With permanent receive enabled the library re-arms after failed frames.
-  // Do not reset a healthy radio merely because one RF frame failed CRC/LDE.
+  // The library automatically re-arms permanent RX after failed frames.
   (void)receiveFailed;
 }
 
@@ -338,7 +342,6 @@ void processOutbound() {
     scheduleRetry();
   }
 
-  // ACKs for received peer DATA always have priority over our own next DATA.
   if (outboundActive && outboundSendScheduled && !txActive && !pendingAck &&
       deadlineReached(now, outboundDeadline)) {
     if (startRawTransmit(outboundPayload, outboundLength, TxKind::Data)) {
@@ -372,8 +375,8 @@ void finishSerialLine() {
 
 
 void processSerialInput() {
-  // The host protocol is stop-and-wait. Do not consume another line until the
-  // current line has received the peer RF ACK or exhausted its retries.
+  // USB-side stop-and-wait: leave later lines queued while one line is waiting
+  // for the peer RF ACK. This is what FirmwareLineTransport expects.
   if (outboundActive) {
     return;
   }
