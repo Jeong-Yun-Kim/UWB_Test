@@ -16,7 +16,7 @@
 | Laptop Serial Port | `/dev/ttyACM0` / 실제: |
 | Jetson Serial Port | `/dev/ttyACM0` / 실제: |
 | USB Serial | 460800 baud |
-| UWB 모드 | `MODE_LONGDATA_FAST_ACCURACY` / 6.8 Mbps |
+| UWB 모드 | `MODE_LONGDATA_RANGE_LOWPOWER` / 110 kbps |
 | 전원 구성 | |
 
 양쪽 ESP32가 같은 UWB 모드와 채널 설정을 사용했는지 확인한다.
@@ -40,7 +40,7 @@ Laptop에서는 `--name laptop`, Jetson에서는 `--name jetson`으로 `host/uwb
 | Laptop → Jetson | `HELLO FROM LAPTOP` | 미실행 | 미실행 | | 미실행 |
 | Jetson → Laptop | `HELLO FROM JETSON` | 미실행 | 미실행 | | 미실행 |
 
-성공 조건은 수신 원문이 같고 송신 측에 `[UWB ACK]`가 표시되는 것이다. `[UWB SENT]`만 표시된 것은 상대편 수신 성공으로 판정하지 않는다.
+성공 조건은 수신 원문이 같고 송신 측에 `[UWB ACK]`가 표시되는 것이다.
 
 ## 4. 양방향 사진
 
@@ -89,7 +89,7 @@ ACK 성공률(%) = ACK 성공 수 / 송신 수 × 100
 
 ## 7. 거리 시험
 
-고속 6.8 Mbps 모드는 장거리 또는 NLOS 환경에서 성능이 낮아질 수 있으므로 실제 운용 장소에서 측정한다.
+현재 기본 모드는 실제 동일 하드웨어에서 통신이 확인된 110 kbps 장거리 모드를 사용한다. 먼저 1~3 m 가시거리에서 양방향 ACK를 확인한 뒤 실제 운용 환경에서 거리와 장애물별로 시험한다.
 
 | 환경 | 거리 | 텍스트 ACK 성공률 | 사진 처리량 | 판정 |
 |---|---:|---:|---:|---|
