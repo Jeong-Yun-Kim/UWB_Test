@@ -61,7 +61,8 @@ cd ~/UWB_Test
 
 ```bash
 cd ~/UWB_Test
-git pull origin main
+git switch main
+git pull --ff-only origin main
 ```
 
 ## 2. ESP32 업로드
@@ -74,13 +75,25 @@ VS Code에서 `~/UWB_Test`를 열고 PlatformIO IDE 확장을 설치한다. `Upl
 PlatformIO → PROJECT TASKS → laptop_node → General → Upload
 ```
 
+또는 CLI:
+
+```bash
+~/.platformio/penv/bin/pio run -e laptop_node -t upload --upload-port /dev/ttyACM0
+```
+
 ### Jetson
 
 ```text
 PlatformIO → PROJECT TASKS → jetson_node → General → Upload
 ```
 
-코드를 변경하지 않았다면 전원을 다시 켠 뒤 재업로드할 필요가 없다. Python 실행 전에는 PlatformIO Serial Monitor를 닫는다.
+또는 CLI:
+
+```bash
+~/.platformio/penv/bin/pio run -e jetson_node -t upload --upload-port /dev/ttyACM0
+```
+
+Python 또는 ROS2 UWB Bridge 실행 전에는 PlatformIO Serial Monitor를 닫는다.
 
 ## 3. Python 설치
 
@@ -146,17 +159,19 @@ python3 host/uwb_node.py --name laptop --port /dev/ttyACM1
 [UWB ACK]
 ```
 
-`[UWB SENT]`는 로컬 송신 완료일 뿐이고, `[UWB ACK]`가 상대편 ESP32의 수신 확인이다. 사진 송신 측의 `[IMAGE SEND COMPLETE]`는 모든 조각이 무선 ACK를 받았다는 뜻이다. 파일 재조립과 SHA-256 검증까지 성공했는지는 반드시 수신 측의 `[IMAGE SAVED]`로 확인한다.
+사진 송신 측의 `[IMAGE SEND COMPLETE]`는 모든 조각이 무선 ACK를 받았다는 뜻이다. 파일 재조립과 SHA-256 검증까지 성공했는지는 반드시 수신 측의 `[IMAGE SAVED]`로 확인한다.
 
 ## 통신 설정과 주의점
 
 - USB Serial: `460800 baud`
-- UWB: `DW1000.MODE_LONGDATA_FAST_ACCURACY`
-- 무선 데이터율: `6.8 Mbps`, 긴 프리앰블
-- ACK timeout 시 자동 재전송
-- 두 DWM1000은 배선뿐 아니라 UWB 모드와 채널 설정도 반드시 같아야 한다.
+- UWB: `DW1000.MODE_LONGDATA_RANGE_LOWPOWER`
+- 무선 데이터율: `110 kbps`, 긴 프리앰블
+- 채널: `5`
+- ACK timeout: `200 ms`
+- ACK가 없으면 최대 4회 재전송
+- 텍스트/상위 프로토콜 한 프레임 최대 payload: `111 bytes`
 
-고속 모드는 기존 장거리 110 kbps 모드보다 사진 전송에 유리하지만, 거리와 벽이 많은 NLOS 환경에서는 수신 여유가 줄 수 있다. 먼저 1~3 m 가시거리에서 양방향 텍스트를 확인한 뒤 실제 건물에서 거리와 장애물별로 시험한다. 표시되는 6.8 Mbps는 무선 PHY 속도이며 파일의 실제 처리량은 ACK, 프리앰블, 분할 및 재전송 때문에 더 낮다.
+현재 펌웨어는 실제 동일 하드웨어에서 통신이 확인된 legacy `uwb_sender/uwb_receiver`의 UWB 모드와 permanent receive 동작을 기반으로 한다. 고속 모드 최적화는 기본 양방향 ACK 통신이 안정적으로 확인된 뒤 별도로 진행한다.
 
 | 항목 | 현재 제한 |
 |---|---|
