@@ -467,6 +467,15 @@ void processTxWatchdog() {
 }
 
 
+bool receiveEventPending() {
+  bool pending = false;
+  noInterrupts();
+  pending = irqReceived || irqReceiveFailed || irqRadioError;
+  interrupts();
+  return pending;
+}
+
+
 void processOutbound() {
   if (!outboundActive) {
     return;
@@ -482,14 +491,28 @@ void processOutbound() {
     scheduleRetry();
   }
 
-  if (outboundActive && outboundSendScheduled && !txActive && !receiverArmed &&
-      !pendingAck && deadlineReached(now, outboundDeadline)) {
-    if (startTransmit(FRAME_DATA, outboundSequence,
-                      outboundPayload, outboundLength, TxKind::Data)) {
-      outboundAttempts++;
-      outboundSendScheduled = false;
-      outboundWaitingForAck = false;
-    }
+  if (!outboundActive || !outboundSendScheduled || txActive || pendingAck ||
+      !deadlineReached(now, outboundDeadline)) {
+    return;
+  }
+
+  // The normal idle state is RX. Before a local DATA transmission, first make
+  // sure an RX completion/error IRQ did not arrive after processRadioEvents().
+  // If it did, leave the buffer untouched and consume it on the next loop.
+  if (receiveEventPending()) {
+    return;
+  }
+
+  if (receiverArmed) {
+    DW1000.idle();
+    receiverArmed = false;
+  }
+
+  if (startTransmit(FRAME_DATA, outboundSequence,
+                    outboundPayload, outboundLength, TxKind::Data)) {
+    outboundAttempts++;
+    outboundSendScheduled = false;
+    outboundWaitingForAck = false;
   }
 }
 
