@@ -39,8 +39,12 @@ constexpr uint8_t MAX_RETRIES = 4;
 constexpr uint8_t MAX_SEND_ATTEMPTS = 1 + MAX_RETRIES;
 constexpr uint32_t ACK_TIMEOUT_MS = 300;
 constexpr uint32_t TX_WATCHDOG_MS = 1000;
-constexpr uint32_t RETRY_BACKOFF_MIN_MS = 20;
-constexpr uint32_t RETRY_BACKOFF_MAX_MS = 100;
+constexpr uint32_t RETRY_BACKOFF_MIN_MS = 25;
+constexpr uint32_t RETRY_BACKOFF_MAX_MS = 120;
+// Give the half-duplex DW1000 a short quiet period around each RX/TX turn.
+// The extra few milliseconds are negligible compared with the 110 kbps RF
+// mode but greatly reduce repeated rapid state transitions during file sends.
+constexpr uint32_t RADIO_SETTLE_MS = 8;
 
 static_assert(LOCAL_NODE_ID > 0 && REMOTE_NODE_ID > 0,
               "Node IDs must be non-zero");
@@ -67,6 +71,7 @@ uint8_t outboundAttempts = 0;
 uint32_t outboundDeadline = 0;
 
 bool pendingAck = false;
+uint32_t nextTransmitAllowedAt = 0;
 
 volatile bool irqSent = false;
 volatile bool irqReceived = false;
@@ -134,10 +139,8 @@ void configureRadio() {
   DW1000.attachReceivedHandler(handleReceived);
   DW1000.attachReceiveFailedHandler(handleReceiveFailed);
 
-  // IMPORTANT: leave permanent receive enabled for the lifetime of the radio.
-  // DW1000::startTransmit() automatically re-enters RX when this flag is true.
-  // This is the same turn-around pattern used by the library MessagePingPong
-  // example and avoids the broken manual RX->TX->RX transition seen earlier.
+  // Leave permanent receive enabled for the lifetime of the radio. DW1000
+  // automatically returns to RX after a TX while this flag is set.
   startPermanentReceiver();
 }
 
@@ -156,15 +159,21 @@ void recoverRadio() {
   pendingAck = false;
   clearIrqFlags();
 
+  // select() performs the full reset/LDE reload path. This is intentionally
+  // stronger than merely toggling RX because the observed field failure leaves
+  // one direction operational while the reverse TX path remains wedged.
   DW1000.select(PIN_SS);
   configureRadio();
+  nextTransmitAllowedAt = millis() + RADIO_SETTLE_MS;
   announceReady();
 }
 
 
 bool startRawTransmit(const byte *payload, size_t payloadLength, TxKind kind) {
+  const uint32_t now = millis();
   if (txActive || payload == nullptr || payloadLength == 0 ||
-      payloadLength > MAX_RF_PAYLOAD_SIZE) {
+      payloadLength > MAX_RF_PAYLOAD_SIZE ||
+      !deadlineReached(now, nextTransmitAllowedAt)) {
     return false;
   }
 
@@ -175,14 +184,12 @@ bool startRawTransmit(const byte *payload, size_t payloadLength, TxKind kind) {
   irqSent = false;
   interrupts();
 
-  // Do NOT disable receivePermanently here. With it left enabled, the DW1000
-  // library starts RX again automatically immediately after starting TX.
   DW1000.newTransmit();
   DW1000.setData(radioTxBuffer, static_cast<uint16_t>(payloadLength));
 
   txKind = kind;
   txActive = true;
-  txStartedAt = millis();
+  txStartedAt = now;
   DW1000.startTransmit();
   return true;
 }
@@ -209,6 +216,10 @@ void finishOutboundFailure() {
   outboundSendScheduled = false;
   outboundAttempts = 0;
   Serial.println(F("[UWB ERROR] ack timeout"));
+
+  // Never leave a failed transfer in the one-way radio state that was observed
+  // after long artifact sends. A later command must begin from a clean DW1000.
+  recoverRadio();
 }
 
 
@@ -219,6 +230,11 @@ void scheduleRetry() {
     finishOutboundFailure();
     return;
   }
+
+  // A missing RF ACK is not treated as a harmless packet loss. In testing the
+  // DW1000 can become asymmetric (RX still works while TX no longer reaches
+  // the peer). Fully recover the radio before retransmitting the same line.
+  recoverRadio();
 
   Serial.print(F("[UWB RETRY] attempt="));
   Serial.println(outboundAttempts + 1);
@@ -248,6 +264,7 @@ void processReceivedPacket() {
   }
 
   DW1000.getData(radioRxBuffer, payloadLength);
+  nextTransmitAllowedAt = millis() + RADIO_SETTLE_MS;
 
   if (isAckToken(radioRxBuffer, payloadLength)) {
     if (outboundActive) {
@@ -283,9 +300,8 @@ void processRadioEvents() {
     const TxKind completedKind = txKind;
     txActive = false;
     txKind = TxKind::None;
+    nextTransmitAllowedAt = millis() + RADIO_SETTLE_MS;
 
-    // No manual receiver restart here. Because permanent RX stayed enabled,
-    // DW1000::startTransmit() already put the hardware back into RX.
     if (completedKind == TxKind::Data && outboundActive) {
       outboundWaitingForAck = true;
       outboundDeadline = millis() + ACK_TIMEOUT_MS;
@@ -298,7 +314,8 @@ void processRadioEvents() {
     processReceivedPacket();
   }
 
-  // The library automatically re-arms permanent RX after failed frames.
+  // Permanent RX is automatically re-armed by the library after failed frames.
+  // A failed frame alone therefore does not justify a destructive reset.
   (void)receiveFailed;
 }
 
@@ -326,7 +343,13 @@ void processTxWatchdog() {
   recoverRadio();
 
   if (dataWasActive && outboundActive) {
-    scheduleRetry();
+    Serial.print(F("[UWB RETRY] attempt="));
+    Serial.println(outboundAttempts + 1);
+    outboundWaitingForAck = false;
+    outboundSendScheduled = true;
+    outboundDeadline = millis() +
+        static_cast<uint32_t>(random(RETRY_BACKOFF_MIN_MS,
+                                     RETRY_BACKOFF_MAX_MS + 1));
   }
 }
 
@@ -412,6 +435,7 @@ void setup() {
   DW1000.begin(PIN_IRQ, PIN_RST);
   DW1000.select(PIN_SS);
   configureRadio();
+  nextTransmitAllowedAt = millis() + RADIO_SETTLE_MS;
 
   announceReady();
 }
